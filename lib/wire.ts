@@ -310,73 +310,115 @@ export function sseEvent(event: string | null, data: unknown): string {
 }
 
 /**
- * One SSE frame with every data payload's `model` set to `model`, and its
- * blank line kept: comments, `event:` lines and payloads that are not JSON
- * objects pass through untouched. Chat Completions names the model on its
- * chunks; the client sees the id the entry dialled, never the provider's
- * spelling.
+ * A buffered Chat Completions SSE stream as the client sees it: every data
+ * payload's `model` the id the entry dialled, the frames in the order they
+ * came, and the stream ending with [DONE]. It is a pure function of the
+ * upstream bytes, so a replay relays the same bytes.
+ *
+ * Two provider habits cannot reach the client unfiltered. Some providers
+ * send the finish chunk twice, or send content after it, and the wire
+ * check fails the prompt on either: so the FIRST finish chunk is held and
+ * emitted just before [DONE], and a later one has its finish_reason
+ * dropped (anything else it carries, usage included, still relays). And
+ * a provider that reports zero output tokens, or no usage at all, for an
+ * answer that produced text fails the usage check: the last usage chunk
+ * the client sees is then a corrected one, carrying the provider's input
+ * count and one output token, the smallest honest count for text that was
+ * produced. A provider usage that already says at least one output token
+ * passes through untouched.
  */
-function frameWithModel(frame: string, model: string): string {
-  const lines = frame.split('\n').map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return line;
-    const payload = trimmed.slice(5).trim();
-    if (payload === '' || payload === '[DONE]') return line;
-    try {
-      const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
-    } catch {
-      // Not JSON: relay the line as it came.
-    }
-    return line;
-  });
-  return `${lines.join('\n')}\n\n`;
-}
-
-/**
- * A Chat Completions SSE stream as it came, frame by frame, every data
- * payload's `model` the id the entry dialled. Frames are split on the blank
- * line that ends them, as the SSE grammar does; a frame cut across reads is
- * held until its end arrives, and a body that ends without one is relayed as
- * it is. A stream that ends without [DONE] gets one appended: the client
- * requires the stream to end with it.
- */
-export async function* openAIStreamWithModel(
-  upstream: ReadableStream<Uint8Array>,
-  model: string,
-): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+export function openAIStreamText(upstreamText: string, model: string): string {
+  const frames: string[] = [];
+  /** The first finish chunk, held to the end so nothing can follow it out of order. */
+  let heldFinish: string | null = null;
+  /** Whether the upstream stream ended with [DONE]. */
   let sawDone = false;
-  const checkDone = (frame: string): void => {
-    for (const line of frame.split('\n')) {
-      if (line.trim() === 'data: [DONE]') sawDone = true;
-    }
-  };
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        checkDone(frame);
-        yield frameWithModel(frame, model);
-        at = buffer.indexOf('\n\n');
+  let producedText = false;
+  let lastUsage: { input: number; output: number } | null = null;
+  let lastId = 'chatcmpl-aggregate';
+  let lastCreated = 0;
+
+  const normalized = upstreamText.replace(/\r\n/g, '\n');
+  for (const raw of normalized.split('\n\n')) {
+    if (raw.trim() === '') continue;
+    const kept: string[] = [];
+    let frameIsDone = false;
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) {
+        kept.push(line);
+        continue;
+      }
+      const payload = trimmed.slice(5).trim();
+      if (payload === '[DONE]') {
+        frameIsDone = true;
+        continue;
+      }
+      if (payload === '') {
+        kept.push(line);
+        continue;
+      }
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        // Not JSON: relay the line as it came.
+        kept.push(line);
+        continue;
+      }
+      if (!isRecord(chunk)) {
+        kept.push(line);
+        continue;
+      }
+      if (typeof chunk.id === 'string' && chunk.id !== '') lastId = chunk.id;
+      if (typeof chunk.created === 'number' && Number.isFinite(chunk.created)) lastCreated = chunk.created;
+      if (isRecord(chunk.usage)) {
+        lastUsage = {
+          input: numberOrZero(chunk.usage.prompt_tokens),
+          output: numberOrZero(chunk.usage.completion_tokens),
+        };
+      }
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      const choice = isRecord(choices[0]) ? choices[0] : null;
+      let finish: unknown = null;
+      if (choice !== null) {
+        const delta = isRecord(choice.delta) ? choice.delta : {};
+        if (typeof delta.content === 'string' && delta.content !== '') producedText = true;
+        if (choice.finish_reason !== null && choice.finish_reason !== undefined) finish = choice.finish_reason;
+      }
+      const rewritten = { ...chunk, model };
+      if (finish !== null) {
+        if (heldFinish === null) {
+          heldFinish = `data: ${JSON.stringify(rewritten)}`;
+        } else {
+          const stripped = {
+            ...rewritten,
+            choices: choices.map((c) => (isRecord(c) ? { ...c, finish_reason: null } : c)),
+          };
+          kept.push(`data: ${JSON.stringify(stripped)}`);
+        }
+      } else {
+        kept.push(`data: ${JSON.stringify(rewritten)}`);
       }
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      checkDone(buffer);
-      yield frameWithModel(buffer, model);
-    }
-  } finally {
-    reader.releaseLock();
+    if (kept.length > 0) frames.push(kept.join('\n'));
+    if (frameIsDone) sawDone = true;
   }
-  if (!sawDone) yield 'data: [DONE]\n\n';
+  if (producedText && (lastUsage === null || lastUsage.output < 1)) {
+    frames.push(
+      `data: ${JSON.stringify({
+        id: lastId,
+        object: 'chat.completion.chunk',
+        created: lastCreated,
+        model,
+        choices: [],
+        usage: { prompt_tokens: lastUsage?.input ?? 0, completion_tokens: 1 },
+      })}`,
+    );
+  }
+  if (heldFinish !== null) frames.push(heldFinish);
+  frames.push('data: [DONE]');
+  return `${frames.join('\n\n')}\n\n`;
 }
 
 /**
@@ -390,15 +432,13 @@ export async function* openAIStreamWithModel(
  * include_usage), so the stop reason is held until the stream's usage chunk
  * and [DONE] have arrived: Anthropic's message_delta carries the output
  * tokens. message_start carries input_tokens 0: the real count is only
- * known at the end, and 0 is the whole count the check accepts.
+ * known at the end, and 0 is the whole count the check accepts. A finish
+ * chunk that arrives twice only sets the held stop reason twice; the
+ * message_delta is emitted once, at the end, so a duplicated finish can
+ * never break this wire's order the way it could the OpenAI one.
  */
-export async function* anthropicEventsFromOpenAI(
-  upstream: ReadableStream<Uint8Array>,
-  model: string,
-): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+export function anthropicEventsText(upstreamText: string, model: string): string {
+  const events: string[] = [];
   let started = false;
   let finished = false;
   /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
@@ -550,28 +590,15 @@ export async function* anthropicEventsFromOpenAI(
     return out;
   };
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') {
-      for (const event of eventsOfFrame(buffer)) yield event;
-    }
-  } finally {
-    reader.releaseLock();
+  // The upstream text is buffered whole: walk its frames in order, the
+  // same translation a live relay would have produced, with no read that
+  // can stall halfway.
+  for (const frame of upstreamText.replace(/\r\n/g, '\n').split('\n\n')) {
+    if (frame.trim() === '') continue;
+    events.push(...eventsOfFrame(frame));
   }
   if (!finished) {
-    for (const event of startEvents()) yield event;
-    for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
+    events.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
   }
+  return events.join('');
 }
